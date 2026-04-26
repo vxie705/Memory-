@@ -1,6 +1,3 @@
-# Memory-
-Rootkit detector based on analyzing inconsistencies between the system handles table and Toolhelp32 process snapshots. Implements Floating Thread Detection in private memory and RWX region scanning, integrating a SIEM telemetry pipeline for remote incident monitoring.
-
 # Advanced Rootkit & Memory Detector
 
 **MEMORY** es una herramienta de monitoreo y detección de amenazas a nivel de kernel y memoria para sistemas Windows. Está diseñada para identificar procesos ocultos, inyecciones de código (shellcode) y comportamientos anómalos que los antivirus convencionales suelen pasar por alto.
@@ -32,15 +29,17 @@ Incluye un pipeline de telemetría que envía eventos en formato JSON a través 
 
 ## 📋 Requisitos y Compilación
 
-Para compilar el proyecto en Visual Studio:
-1. Asegúrate de incluir las siguientes librerías en el linker:
-   - `wintrust.lib`
-   - `psapi.lib`
-   - `ntdll.lib`
-   - `ws2_32.lib`
-   - `iphlpapi.lib`
+### Opción 1: Visual Studio (MSVC)
+1. Asegúrate de incluir las siguientes librerías en el linker: `wintrust.lib`, `psapi.lib`, `ntdll.lib`, `ws2_32.lib`, `iphlpapi.lib`.
 2. Configura el proyecto para **x64**.
-3. Ejecuta como **Administrador** (necesario para `SeDebugPrivilege`).
+3. Ejecuta como **Administrador**.
+
+### Opción 2: MinGW (g++) - Recomendado para portabilidad
+Si usas MinGW, ejecuta el siguiente comando para generar un ejecutable estático que no dependa de DLLs externas:
+
+```bash
+g++ -O2 detector_apex_hardened.cpp -o Memory.exe -static -static-libgcc -static-libstdc++ -lwintrust -lpsapi -lntdll -ladvapi32 -lws2_32 -liphlpapi -luser32
+```
 
 ## 🔍 Detalles de la Lógica de Riesgo
 El sistema asigna puntos basados en:
