@@ -1,0 +1,314 @@
+/**
+ * @file
+ * @author
+ * @brief
+ * @version
+ */
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define INITGUID
+#include <iostream>
+#include <fstream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <tlhelp32.h>
+#include <unordered_set>
+#include <unordered_map>
+#include <vector>
+#include <psapi.h>
+#include <thread>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <wintrust.h>
+#include <softpub.h>
+#include <winternl.h>
+#include <wincrypt.h>
+#include <evntrace.h>
+#include <evntcons.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004
+#define SystemExtendedHandleInformation 64
+#define MAX_PID_RANGE 262144
+#define PID_STEP 4
+// ETW
+DEFINE_GUID(MS_KERNEL_PROCESS_PROVIDER, 0x22fb2cd6, 0x0e7b, 0x422b, 0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16);
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    PVOID Object; ULONG_PTR UniqueProcessId; ULONG_PTR HandleValue; ULONG GrantedAccess;
+    USHORT CreatorBackTraceIndex; USHORT ObjectTypeIndex; ULONG HandleAttributes; ULONG Reserved;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR NumberOfHandles; ULONG_PTR Reserved; SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
+struct ProcessContext { DWORD ppid = 0; ULONG threadCount = 0; SIZE_T memKB = 0; std::string processName = ""; };
+struct TemporalState {
+    bool hasNetwork = false; bool hasFileDrop = false; bool hasInjectedThread = false;
+    int lifeCycles = 0; int highestScore = 0; bool isQuarantined = false;
+};
+
+struct ProcessRisk { int score = 0; std::string level = "LOW"; std::string tags = ""; };
+std::unordered_map<DWORD, TemporalState> g_TemporalEngine;
+std::unordered_map<std::string, std::string> g_SignatureCache;
+std::unordered_map<std::string, std::string> g_HashCache; 
+std::unordered_set<DWORD> g_ReportedPIDs;
+std::unordered_map<DWORD, ProcessContext> g_OfficialMap;
+const std::vector<std::string> g_LOLBins = { "powershell.exe", "cmd.exe", "rundll32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "regsvr32.exe", "certutil.exe" };
+std::vector<DWORD> g_ETWEventQueue;
+CRITICAL_SECTION g_ETWMutex;
+/* ============================================================================
+ * SIEM PIPELINE
+ * ============================================================================ */
+class SIEMPipeline {
+private:
+    std::vector<std::string> eventBuffer; const size_t BATCH_SIZE = 5;
+    void Transmit(const std::string& payload) {
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
+            SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (s != INVALID_SOCKET) {
+                sockaddr_in server; server.sin_family = AF_INET; server.sin_port = htons(514); server.sin_addr.s_addr = inet_addr("127.0.0.1");
+                sendto(s, payload.c_str(), payload.length(), 0, (sockaddr*)&server, sizeof(server)); closesocket(s);
+            }
+            WSACleanup();
+        }
+    }
+    void SendBatch() {
+        if (eventBuffer.empty()) return;
+        std::stringstream batchPayload; batchPayload << "[";
+        for (size_t i = 0; i < eventBuffer.size(); ++i) batchPayload << eventBuffer[i] << (i < eventBuffer.size() - 1 ? "," : "");
+        batchPayload << "]"; Transmit(batchPayload.str()); eventBuffer.clear();
+    }
+public:
+    void QueueEvent(const std::string& json, const std::string& riskLevel) {
+        if (riskLevel == "LOW") return; 
+        if (riskLevel == "CRITICAL") { Transmit("[" + json + "]"); return; }
+        eventBuffer.push_back(json); if (eventBuffer.size() >= BATCH_SIZE) SendBatch();
+    }
+    void Flush() { SendBatch(); }
+};
+SIEMPipeline g_Pipeline;
+/* ============================================================================
+ * HELPERS Y PRIVILEGIOS
+ * ============================================================================ */
+bool EnableDebugPrivilege() {
+    HANDLE hToken; LUID luid; TOKEN_PRIVILEGES tkp;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
+    if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) { CloseHandle(hToken); return false; }
+    tkp.PrivilegeCount = 1; tkp.Privileges[0].Luid = luid; tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    bool result = AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+    CloseHandle(hToken); return result;
+}
+std::string GetTimestamp() {
+    auto now = std::chrono::system_clock::now(); std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm bt; localtime_s(&bt, &now_c); std::stringstream ss; ss << std::put_time(&bt, "%Y-%m-%dT%H:%M:%S"); return ss.str();
+}
+std::string GetWin32Path(const char* devicePath) {
+    char szWin32Path[MAX_PATH]; char szDrive[3] = " :"; char szDevice[MAX_PATH];
+    for (char c = 'A'; c <= 'Z'; c++) {
+        szDrive[0] = c;
+        if (QueryDosDeviceA(szDrive, szDevice, MAX_PATH)) {
+            size_t nLen = strlen(szDevice);
+            if (nLen > 0 && _strnicmp(devicePath, szDevice, nLen) == 0) {
+                sprintf_s(szWin32Path, "%s%s", szDrive, devicePath + nLen); return std::string(szWin32Path);
+            }
+        }
+    }
+    return std::string(devicePath);
+}
+bool SuspendMaliciousProcess(DWORD pid) {
+    typedef NTSTATUS (NTAPI *pNtSuspendProcess)(HANDLE ProcessHandle);
+    pNtSuspendProcess NtSuspendProcess = (pNtSuspendProcess)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
+    if (!NtSuspendProcess) return false;
+
+    HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pid);
+    if (hProcess) {
+        NTSTATUS status = NtSuspendProcess(hProcess);
+        CloseHandle(hProcess);
+        return (status == 0);
+    }
+    return false;
+}
+std::string GetNetworkConnectionsForPID(DWORD targetPID) {
+    DWORD size = 0;
+    GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0) return "";
+
+    std::string connections = "";
+    PMIB_TCPTABLE_OWNER_PID pTcpTable = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
+    if (pTcpTable && GetExtendedTcpTable(pTcpTable, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < pTcpTable->dwNumEntries; i++) {
+            if (pTcpTable->table[i].dwOwningPid == targetPID) {
+                if (pTcpTable->table[i].dwState == MIB_TCP_STATE_ESTAB) {
+                    struct in_addr ipAddr; ipAddr.S_un.S_addr = (u_long)pTcpTable->table[i].dwRemoteAddr;
+                    std::string ipStr = inet_ntoa(ipAddr);
+                    if (ipStr != "127.0.0.1" && ipStr != "0.0.0.0") connections += ipStr + " ";
+                }
+            }
+        }
+    }
+    if (pTcpTable) free(pTcpTable);
+    return connections;
+}
+bool ValidateThreadOrigin(HANDLE hProc, PVOID startAddr) {
+    HMODULE hMods[1024]; DWORD cbNeeded;
+    if (EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
+        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+            MODULEINFO mi;
+            if (GetModuleInformation(hProc, hMods[i], &mi, sizeof(mi))) {
+                if (startAddr >= mi.lpBaseOfDll && startAddr < (PBYTE)mi.lpBaseOfDll + mi.SizeOfImage) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+bool DetectDeepFloatingThreads(DWORD pid, HANDLE hProc) {
+    HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hThreadSnap == INVALID_HANDLE_VALUE) return false;
+    THREADENTRY32 te32; te32.dwSize = sizeof(THREADENTRY32);
+    if (Thread32First(hThreadSnap, &te32)) {
+        typedef NTSTATUS(NTAPI *PNtQueryInformationThread)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        PNtQueryInformationThread pNtQIT = (PNtQueryInformationThread)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+        do {
+            if (te32.th32OwnerProcessID == pid) {
+                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
+                if (hThread && pNtQIT) {
+                    PVOID startAddr = 0;
+                    if (pNtQIT(hThread, 9, &startAddr, sizeof(startAddr), NULL) == 0) {
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (VirtualQueryEx(hProc, startAddr, &mbi, sizeof(mbi))) {
+                            if (mbi.Type == MEM_PRIVATE && mbi.Protect == PAGE_EXECUTE_READWRITE) {
+                                // Doble chequeo: ¿Pertenece a algun modulo?
+                                if (!ValidateThreadOrigin(hProc, startAddr)) {
+                                    CloseHandle(hThread); CloseHandle(hThreadSnap);
+                                    return true; 
+                                }
+                            }
+                        }
+                    }
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(hThreadSnap, &te32));
+    }
+    CloseHandle(hThreadSnap);
+    return false;
+}
+std::string VerifyDigitalSignature(const std::string& path, bool& isSigned) {
+    if (path.empty() || path == "[ACCESS DENIED]") { isSigned = false; return "N/A"; }
+    wchar_t wPath[MAX_PATH]; MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wPath, MAX_PATH);
+    WINTRUST_FILE_INFO FileData = {0}; FileData.cbStruct = sizeof(WINTRUST_FILE_INFO); FileData.pcwszFilePath = wPath;
+    GUID WVTPolicyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA WinTrustData = {0}; WinTrustData.cbStruct = sizeof(WINTRUST_DATA); WinTrustData.dwUIChoice = WTD_UI_NONE;
+    WinTrustData.dwUnionChoice = WTD_CHOICE_FILE; WinTrustData.pFile = &FileData; WinTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    LONG lStatus = WinVerifyTrust(NULL, &WVTPolicyGUID, &WinTrustData);
+    WinTrustData.dwStateAction = WTD_STATEACTION_CLOSE; WinVerifyTrust(NULL, &WVTPolicyGUID, &WinTrustData);
+    isSigned = (lStatus == ERROR_SUCCESS);
+    return isSigned ? "FIRMADO" : "NO FIRMADO";
+}
+ProcessRisk AnalyzeBehaviorHardened(DWORD pid, const std::string& processName, const std::string& parentName, bool isSigned, bool isHidden, bool hasDeepInjection, SIZE_T rwxKB, const std::string& net) {
+    ProcessRisk r; r.score = 0;
+    if (isHidden) { r.score += 45; r.tags += "[HIDDEN] "; }
+    if (hasDeepInjection) { r.score += 80; r.tags += "[SHELLCODE_THREAD] "; }
+    else if (rwxKB > 0) {
+        if (!isSigned) { r.score += 40; r.tags += "[SUSPICIOUS_RWX] "; }
+        else r.tags += "[LEGIT_JIT] ";
+    }
+    if (!net.empty()) {
+        r.tags += "[NET_ACTIVA] ";
+        if (!isSigned || isHidden) r.score += 40;
+    }
+
+    if (r.score >= 100) { r.score = 100; r.level = "CRITICAL"; }
+    else if (r.score >= 70) r.level = "HIGH";
+    else if (r.score >= 30) r.level = "MEDIUM";
+    else r.level = "LOW";
+
+    return r;
+}
+void GetOfficialProcessList() {
+    g_OfficialMap.clear();
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe32; pe32.dwSize = sizeof(PROCESSENTRY32);
+        if (Process32First(hSnap, &pe32)) {
+            do {
+                ProcessContext ctx; ctx.ppid = pe32.th32ParentProcessID; ctx.processName = pe32.szExeFile;
+                g_OfficialMap[pe32.th32ProcessID] = ctx; 
+            } while (Process32Next(hSnap, &pe32));
+        }
+        CloseHandle(hSnap);
+    }
+}
+void ScanSystemHandlesNative(std::unordered_set<DWORD>& realList) {
+    HMODULE hNtDll = GetModuleHandleA("ntdll.dll"); if (!hNtDll) return;
+    typedef NTSTATUS(WINAPI *PNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+    PNtQuerySystemInformation pNtQuery = (PNtQuerySystemInformation)GetProcAddress(hNtDll, "NtQuerySystemInformation");
+    ULONG bufferSize = 1024 * 1024 * 2; PVOID buffer = malloc(bufferSize); ULONG len = 0;
+    if (pNtQuery(SystemExtendedHandleInformation, buffer, bufferSize, &len) == 0) {
+        PSYSTEM_HANDLE_INFORMATION_EX pInfo = (PSYSTEM_HANDLE_INFORMATION_EX)buffer;
+        for (ULONG_PTR i = 0; i < pInfo->NumberOfHandles; i++) realList.insert((DWORD)pInfo->Handles[i].UniqueProcessId);
+    }
+    free(buffer);
+}
+void AnalyzeSuspects(const std::unordered_set<DWORD>& suspects, bool isFromBrute) {
+    for (DWORD pid : suspects) {
+        if (g_ReportedPIDs.count(pid)) continue;
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!hProc) hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        std::string path = ""; char rawPath[MAX_PATH]; DWORD sz = MAX_PATH;
+        if (hProc && QueryFullProcessImageNameA(hProc, 0, rawPath, &sz)) path = GetWin32Path(rawPath);
+        
+        std::string name = path.empty() ? "UNKNOWN" : path.substr(path.find_last_of("\\") + 1);
+        bool isSigned = false; VerifyDigitalSignature(path, isSigned);        
+        SIZE_T rwx = 0;
+        MEMORY_BASIC_INFORMATION mbi; PVOID addr = 0;
+        if (hProc) {
+            while (VirtualQueryEx(hProc, addr, &mbi, sizeof(mbi))) {
+                if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && mbi.Protect == PAGE_EXECUTE_READWRITE) rwx += (mbi.RegionSize / 1024);
+                addr = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+            }
+        }
+        bool hasDeepInjec = hProc ? DetectDeepFloatingThreads(pid, hProc) : false;
+        std::string net = GetNetworkConnectionsForPID(pid);
+        
+        ProcessRisk risk = AnalyzeBehaviorHardened(pid, name, "UNKNOWN", isSigned, isFromBrute, hasDeepInjec, rwx, net);
+        if (risk.level == "CRITICAL" && !isSigned && pid > 1000) {
+            if (SuspendMaliciousProcess(pid)) {
+                risk.tags += "[QUARANTINED] ";
+                g_TemporalEngine[pid].isQuarantined = true;
+            }
+        }
+        if (risk.score > 20) {
+            g_ReportedPIDs.insert(pid);
+            std::cout << "[" << GetTimestamp() << "] PID: " << std::setw(6) << pid << " | " << std::setw(20) << name << " | RIESGO: " << std::setw(10) << risk.level << " | TAGS: " << risk.tags << "\n";
+        }
+        if (hProc) CloseHandle(hProc);
+    }
+}
+int main() {
+    SetConsoleOutputCP(CP_UTF8); EnableDebugPrivilege();
+    std::cout << "=================================================================\n";
+    std::cout << " (MEMORY QUARANTINE & JIT EXCLUSIONS)\n";
+    std::cout << "=================================================================\n";
+    int cycle = 1;
+    while (true) {
+        GetOfficialProcessList();
+        std::unordered_set<DWORD> handles, hidden;
+        ScanSystemHandlesNative(handles);
+        for (DWORD pid : handles) if (g_OfficialMap.find(pid) == g_OfficialMap.end()) hidden.insert(pid);
+        if (!hidden.empty()) AnalyzeSuspects(hidden, true);
+        std::cout << "\r[*] Ciclo #" << cycle << " | Escaneando con Deep Thread Validation..." << std::flush;
+        Sleep(2000); cycle++;
+    }
+    return 0;
+}
