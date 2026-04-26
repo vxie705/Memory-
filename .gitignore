@@ -1,11 +1,34 @@
 # Prerequisites
 *.d
 
+# Carpetas de compilación de Visual Studio y MSVC
+.vs/
+x64/
+x86/
+Debug/
+Release/
+ipch/
+
+# Archivos de configuración de usuario
+*.suo
+*.user
+*.sln.docstates
 # Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
+
+# Archivos temporales de VS
+*.db
+*.opendb
+*.VC.db
+
+# Binarios específicos de Windows que no queremos en Git
+Memory.exe
+*.msi
+*.msm
+*.msp
 
 # Precompiled Headers
 *.gch
