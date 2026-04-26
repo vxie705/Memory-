@@ -35,6 +35,15 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
+// Colores ANSI
+#define CLR_RESET   "\033[0m"
+#define CLR_RED     "\033[31m"
+#define CLR_YELLOW  "\033[33m"
+#define CLR_GREEN   "\033[32m"
+#define CLR_CYAN    "\033[36m"
+#define CLR_WHITE   "\033[37m"
+#define CLR_BOLD    "\033[1m"
+
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004
 #define SystemExtendedHandleInformation 64
 #define MAX_PID_RANGE 262144
@@ -74,8 +83,14 @@ private:
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
             SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (s != INVALID_SOCKET) {
-                sockaddr_in server; server.sin_family = AF_INET; server.sin_port = htons(514); server.sin_addr.s_addr = inet_addr("127.0.0.1");
-                sendto(s, payload.c_str(), payload.length(), 0, (sockaddr*)&server, sizeof(server)); closesocket(s);
+                sockaddr_in server;
+                server.sin_family = AF_INET;
+                server.sin_port = htons(514);
+
+                if (InetPtonA(AF_INET, "127.0.0.1", &server.sin_addr) == 1) {
+                    sendto(s, payload.c_str(), (int)payload.length(), 0, (sockaddr*)&server, sizeof(server));
+                }
+                closesocket(s);
             }
             WSACleanup();
         }
@@ -290,16 +305,35 @@ void AnalyzeSuspects(const std::unordered_set<DWORD>& suspects, bool isFromBrute
         }
         if (risk.score > 20) {
             g_ReportedPIDs.insert(pid);
-            std::cout << "[" << GetTimestamp() << "] PID: " << std::setw(6) << pid << " | " << std::setw(20) << name << " | RIESGO: " << std::setw(10) << risk.level << " | TAGS: " << risk.tags << "\n";
+            
+            std::string color = CLR_WHITE;
+            if (risk.level == "CRITICAL") color = CLR_RED;
+            else if (risk.level == "HIGH") color = CLR_YELLOW;
+            else if (risk.level == "MEDIUM") color = CLR_CYAN;
+
+            std::cout << "[" << CLR_GREEN << GetTimestamp() << CLR_RESET << "] "
+                      << "PID: " << CLR_BOLD << std::setw(6) << pid << CLR_RESET << " | "
+                      << std::setw(20) << name << " | "
+                      << "RIESGO: " << color << std::setw(10) << risk.level << CLR_RESET << " | "
+                      << "TAGS: " << CLR_WHITE << risk.tags << CLR_RESET << "\n";
         }
         if (hProc) CloseHandle(hProc);
     }
 }
 int main() {
-    SetConsoleOutputCP(CP_UTF8); EnableDebugPrivilege();
-    std::cout << "=================================================================\n";
-    std::cout << " (MEMORY QUARANTINE & JIT EXCLUSIONS)\n";
-    std::cout << "=================================================================\n";
+    // Activar soporte para colores ANSI en la consola de Windows
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, dwMode);
+
+    SetConsoleOutputCP(CP_UTF8); 
+    EnableDebugPrivilege();
+
+    std::cout << CLR_CYAN << "=================================================================\n" << CLR_RESET;
+    std::cout << CLR_BOLD << "  Advanced Rootkit & Memory Detector\n" << CLR_RESET;
+    std::cout << CLR_CYAN << "=================================================================\n" << CLR_RESET;
     int cycle = 1;
     while (true) {
         GetOfficialProcessList();
